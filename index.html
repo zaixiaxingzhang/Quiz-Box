@@ -1321,6 +1321,9 @@ const Nav = {
     app.appendChild(el);
 
     // 下一帧同时触发两个动画，保证完全同步
+    // 每次 push 追加一条历史，保证每一层都能用系统返回键退回
+    history.pushState({ depth: State.pageStack.length }, '', location.href);
+
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         // 旧页面：推向左后方
@@ -1328,7 +1331,6 @@ const Nav = {
           topEl.style.transition = 'transform 0.3s cubic-bezier(0.4,0,0.2,1), opacity 0.3s cubic-bezier(0.4,0,0.2,1)';
           topEl.style.transform = 'translateX(-8%) scale(0.97)';
           topEl.style.opacity = '0.85';
-          // 动画结束后清理 transition，避免后续 pop 受影响
           topEl.addEventListener('transitionend', () => {
             topEl.style.transition = '';
           }, { once: true });
@@ -1374,8 +1376,11 @@ const Nav = {
 
     State.batchMode = false;
     State.batchSelected.clear();
-    // 返回时刷新首页摘要（错题数、积分、总题数）
-    setTimeout(() => Nav.refreshHome(), 350);
+    // 返回时刷新上一页（如果有 _refreshFn）和首页摘要
+    setTimeout(async () => {
+      await Nav.refreshCurrent();
+      Nav.refreshHome();
+    }, 350);
   },
   // 返回首页（清除所有子页面）
   home() {
@@ -1460,6 +1465,7 @@ const Pages = {
         <span class="appbar-title">${Utils.esc(title)}</span>
         <div class="appbar-actions">
           ${extraButtons}
+          <button class="appbar-btn" onclick="Actions.showContact()" title="技术沟通"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2,4 12,13 22,4"/></svg></button>
           <button class="appbar-btn" onclick="Actions.importJSON()" title="导入">${Icons.import}</button>
           <button class="appbar-btn" onclick="Actions.exportJSON()" title="导出">${Icons.export}</button>
           <button class="appbar-btn" id="theme-btn" onclick="Actions.toggleTheme()" title="切换主题">
@@ -1529,6 +1535,7 @@ const Pages = {
           <span>刷题宝</span>
         </div>
         <div class="appbar-actions">
+          <button class="appbar-btn" onclick="Actions.showContact()" title="技术沟通"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2,4 12,13 22,4"/></svg></button>
           <button class="appbar-btn" onclick="Actions.importJSON()" title="导入">${Icons.import}</button>
           <button class="appbar-btn" onclick="Actions.exportJSON()" title="导出">${Icons.export}</button>
           <button class="appbar-btn" id="theme-btn" onclick="Actions.toggleTheme()" title="切换主题">
@@ -1893,8 +1900,8 @@ const Pages = {
             ${q.wrongCount>0?`<span class="tag tag-danger">错${q.wrongCount}次</span>`:''}
             ${q.rightCount>0?`<span class="tag tag-success">对${q.rightCount}次</span>`:''}
           </div>
-          <button onclick="event.stopPropagation();Nav.push('editQ',{folderId:${q.folderId},qId:${q.id}})" 
-            style="color:var(--accent);padding:4px 8px;font-size:13px;display:flex;align-items:center;gap:3px;border:1px solid var(--accent-light);border-radius:6px;background:var(--accent-light)">${Icons.edit} <span style="font-size:12px">编辑</span></button>
+            <button onclick="event.stopPropagation();Nav.push('editQ',{folderId:${q.folderId},qId:${q.id}})" 
+              style="color:var(--accent);padding:4px 8px;font-size:13px;display:flex;align-items:center;gap:3px;border:1px solid var(--accent-light);border-radius:6px;background:var(--accent-light)">${Icons.edit} <span style="font-size:12px">编辑</span></button>
         </div>
       </div>`;
   },
@@ -2151,20 +2158,24 @@ const Pages = {
         // 填空题：读取多答案
         const fillAnswers = [...content.querySelectorAll('[data-fill-ans]')].map(i => i.value.trim()).filter(Boolean);
         if (!fillAnswers.length) { Utils.toast('请输入答案'); return; }
-        await DB.saveQuestion({
+        const fillData = {
           ...(q || { wrongCount: 0, rightCount: 0, weight: 1, starred: false }),
-          id: qId || undefined, folderId, type: qType, question,
+          folderId, type: qType, question,
           options: undefined, answer: fillAnswers[0], answers: fillAnswers,
           explanation, updatedAt: Date.now(),
-        });
+        };
+        if (qId) fillData.id = qId;
+        await DB.saveQuestion(fillData);
         Utils.toast(qId ? '已保存' : '已添加');
         await Nav.pop(); return;
       }
-      await DB.saveQuestion({
+      const saveData = {
         ...(q || { wrongCount: 0, rightCount: 0, weight: 1, starred: false }),
-        id: qId || undefined, folderId, type: qType, question,
+        folderId, type: qType, question,
         options, answer, explanation, updatedAt: Date.now(),
-      });
+      };
+      if (qId) saveData.id = qId;
+      await DB.saveQuestion(saveData);
       Utils.toast(qId ? '已保存' : '已添加');
       await Nav.pop();
     };
@@ -2605,6 +2616,7 @@ const Pages = {
     el.className = 'page';
     el.style.display = 'flex';
     el.style.flexDirection = 'column';
+    el._isQuizPage = true; // 标记为做题页，阻止 popstate 误触返回
 
     let curIdx = startIdx;
     let answered = false;
@@ -2734,6 +2746,7 @@ const Pages = {
       } else {
         // 填空题
         const fillCorrect = answered ? isCorrect(q, userAnswer) : false;
+        const fillSkipped = answered && userAnswer === '__skipped__';
         const allAnswers = q.answers && q.answers.length ? q.answers : [q.answer];
         qBody = `
           <div class="fill-input-wrap">
@@ -2743,8 +2756,8 @@ const Pages = {
           </div>
           ${answered ? `
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-              <span class="tag ${fillCorrect ? 'tag-success' : 'tag-danger'}">
-                ${fillCorrect ? '✓ 正确' : '✗ 错误'}
+              <span class="tag ${fillCorrect ? 'tag-success' : fillSkipped ? 'tag-warn' : 'tag-danger'}">
+                ${fillCorrect ? '✓ 正确' : fillSkipped ? '？ 不会做' : '✗ 错误'}
               </span>
             </div>
             <div style="background:var(--success-light);border-radius:10px;padding:12px;margin-bottom:8px">
@@ -2758,8 +2771,13 @@ const Pages = {
         `;
       }
 
+      // 搜题按钮（答完或不会做后显示，放在题型badge同行右边）
+      const showSearch = answered && !isExam;
       body.innerHTML = `
-        <div class="quiz-type-badge">${q.type}</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div class="quiz-type-badge" style="margin-bottom:0">${q.type}</div>
+          ${showSearch ? `<button id="quiz-search-btn" style="display:flex;align-items:center;gap:3px;color:var(--accent);font-size:12px;padding:3px 8px;border:1px solid var(--accent-light);border-radius:12px;background:var(--accent-light)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>&nbsp;搜题</button>` : ''}
+        </div>
         <div class="quiz-question">${Utils.esc(q.question)}</div>
         ${qBody}
         ${answered && q.explanation ? `
@@ -2768,6 +2786,11 @@ const Pages = {
             <div class="explanation-text">${Utils.esc(q.explanation)}</div>
           </div>` : ''}
       `;
+      if (showSearch) {
+        body.querySelector('#quiz-search-btn')?.addEventListener('click', () => {
+          window.open('https://www.baidu.com/s?wd=' + encodeURIComponent(q.question), '_blank');
+        });
+      }
 
       // 选项点击
       if (!answered || isExam) {
@@ -2821,17 +2844,17 @@ const Pages = {
         `;
       } else {
         footer.innerHTML = `
-          <button class="btn btn-outline" ${isFirst?'disabled':''} onclick="this.closest('.page')._prev()" style="${isFirst?'opacity:0.4':''}">上题</button>
+          <button class="btn btn-outline" ${isFirst?'disabled':''} onclick="this.closest('.page')._prev()" style="padding:10px 8px;font-size:13px;flex:0 0 auto;${isFirst?'opacity:0.4':''}">上题</button>
           ${!answered
             ? (q?.type === '填空'
-                ? `<span style="display:flex;gap:8px;flex:1">
-                    <button class="btn btn-outline flex-1" onclick="this.closest('.page')._skipQ()" style="color:var(--text3)">跳过</button>
+                ? `<span style="display:flex;gap:6px;flex:1">
+                    <button class="btn btn-outline" onclick="this.closest('.page')._skipQ()" style="color:var(--warn);border-color:var(--warn);flex:0 0 auto;padding:10px 12px">不会做</button>
                     <button class="btn btn-primary flex-1" onclick="this.closest('.page')._submitFill()">提交</button>
                   </span>`
                 : isMulti
                   ? `<button class="btn btn-primary flex-1" onclick="this.closest('.page')._submitMulti()" ${multiSelected.length===0?'disabled style="opacity:0.4"':''}>提交答案</button>`
-                  : `<span style="display:flex;gap:8px;flex:1">
-                      <button class="btn btn-outline flex-1" onclick="this.closest('.page')._skipQ()" style="color:var(--text3)">跳过</button>
+                  : `<span style="display:flex;gap:6px;flex:1">
+                      <button class="btn btn-outline" onclick="this.closest('.page')._skipQ()" style="color:var(--warn);border-color:var(--warn);flex:0 0 auto;padding:10px 12px">不会做</button>
                       <button class="btn btn-primary flex-1" onclick="this.closest('.page')._submitSingle()" ${!userAnswer?'disabled style="opacity:0.4"':''}>提交</button>
                     </span>`)
             : `<button class="btn btn-primary flex-1" onclick="this.closest('.page').${isLast ? '_finish' : '_next'}()">${isLast ? '完成' : '下一题'}</button>`
@@ -2843,6 +2866,7 @@ const Pages = {
     // 统一判断是否正确（支持多答案 q.answers 数组 或 单答案 q.answer）
     function isCorrect(q, ua) {
       if (!ua && ua !== 0) return false;
+      if (ua === '__skipped__') return false;
       const ans = q.answers && q.answers.length ? q.answers : q.answer;
       if (q.type === '填空') return Utils.matchFill(ua, ans);
       if (q.type === '多选') {
@@ -2864,7 +2888,8 @@ const Pages = {
       answered = true;
       answers[curIdx] = userAnswer;
 
-      const correct = isCorrect(q, userAnswer);
+      const skipped = userAnswer === '__skipped__';
+      const correct = !skipped && isCorrect(q, userAnswer);
 
       // 更新权重和统计
       if (!isExam) {
@@ -2873,6 +2898,7 @@ const Pages = {
           freshQ.rightCount = (freshQ.rightCount || 0) + 1;
           freshQ.weight = Math.max(1, (freshQ.weight || 1) - 0.3);
         } else {
+          // 答错或不会做都增加 wrongCount
           freshQ.wrongCount = (freshQ.wrongCount || 0) + 1;
           freshQ.weight = Math.min(10, (freshQ.weight || 1) + 0.5 + freshQ.wrongCount * 0.1);
         }
@@ -2886,7 +2912,7 @@ const Pages = {
         await DB.setMeta('totalRight', totalRight);
         await DB.setMeta('totalWrong', totalWrong);
 
-        const pts = correct ? 2 : 0;
+        const pts = (correct && !skipped) ? 2 : 0;
         const points = ((await DB.getMeta('points')) || 0) + pts;
         State.points = points;
         await DB.setMeta('points', points);
@@ -3020,6 +3046,12 @@ const Pages = {
       `;
       el._viewPrev = () => { if (curIdx > 0) { curIdx--; renderQView(); } };
       el._viewNext = () => { if (curIdx < questions.length - 1) { curIdx++; renderQView(); } };
+      // 考试复查模式：显示搜索按钮
+      const viewSearchBtn = document.createElement('button');
+      viewSearchBtn.style.cssText = 'display:flex;align-items:center;gap:6px;color:var(--accent);font-size:13px;padding:6px 0';
+      viewSearchBtn.innerHTML = Icons.search + ' <span>百度搜索题目</span>';
+      viewSearchBtn.onclick = () => window.open('https://www.baidu.com/s?wd=' + encodeURIComponent(q.question), '_blank');
+      body.appendChild(viewSearchBtn);
     }
 
     // 方法绑定
@@ -3053,19 +3085,10 @@ const Pages = {
       if (!userAnswer) { Utils.toast('请输入答案'); return; }
       submitAnswer();
     };
-    el._skipQ = async () => {
-      // 跳过 = 不会做，等同于答错：增加 wrongCount 和权重，纳入错题本
-      const q = questions[curIdx];
-      if (q && q.id) {
-        const freshQ = (await DB.getAllQuestions()).find(x => x.id === q.id) || q;
-        freshQ.wrongCount = (freshQ.wrongCount || 0) + 1;
-        freshQ.weight = Math.min(10, (freshQ.weight || 1) + 0.5 + freshQ.wrongCount * 0.1);
-        Object.assign(q, freshQ);
-        answers[curIdx] = '__skipped__'; // 标记为跳过
-        await DB.saveQuestion(freshQ);
-      }
-      if (curIdx < questions.length - 1) { curIdx++; multiSelected = []; userAnswer = null; renderQ(); }
-      else el._finish();
+    el._skipQ = () => {
+      // 不会做 = 用空字符串作答，走 submitAnswer 流程显示解析，权重增加在 submitAnswer 里处理
+      userAnswer = '__skipped__';
+      submitAnswer();
     };
     el._submitSingle = () => {
       if (!userAnswer) { Utils.toast('请先选择答案'); return; }
@@ -3135,8 +3158,75 @@ const Actions = {
     });
   },
 
-  // 导入JSON
+  showContact() {
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay center';
+    ov.innerHTML = `
+      <div class="modal-dialog" style="max-width:300px;text-align:center">
+        <div style="font-size:36px;margin-bottom:10px">✉️</div>
+        <div class="modal-title" style="margin-bottom:18px">技术沟通</div>
+        <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:20px">
+          <div style="display:flex;align-items:center;gap:10px;background:var(--surface2);border-radius:10px;padding:12px 14px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2,4 12,13 22,4"/></svg>
+            <span style="font-size:14px;color:var(--text);user-select:all">1398124361@qq.com</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;background:var(--surface2);border-radius:10px;padding:12px 14px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <span style="font-size:14px;color:var(--text);user-select:all">QQ：1398124361</span>
+          </div>
+        </div>
+        <div style="font-size:12px;color:var(--text3);line-height:1.6;border-top:1px solid var(--border);padding-top:14px">
+          本网页由临沂市机电工程学校<br>23级电气学生设计
+        </div>
+        <button class="btn btn-outline btn-block" style="margin-top:14px" onclick="this.closest('.modal-overlay').remove()">关闭</button>
+      </div>`;
+    ov.onclick = e => { if (e.target === ov) ov.remove(); };
+    document.body.appendChild(ov);
+  },
+
+  // 导入JSON - 弹窗选择本地/URL导入
   async importJSON() {
+    return new Promise(resolve => {
+      const ov = document.createElement('div');
+      ov.className = 'modal-overlay';
+      ov.innerHTML = `
+        <div class="modal-sheet">
+          <div class="modal-handle"></div>
+          <div class="modal-title" style="margin-bottom:16px">导入题库</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <button class="btn btn-outline btn-block" id="import-local-btn" style="justify-content:flex-start;gap:12px;padding:14px 16px">
+              <span style="font-size:22px">📂</span>
+              <div style="text-align:left">
+                <div style="font-weight:500">本地文件导入</div>
+                <div style="font-size:12px;color:var(--text3);margin-top:2px">从设备选择 JSON 文件</div>
+              </div>
+            </button>
+            <button class="btn btn-outline btn-block" id="import-url-btn" style="justify-content:flex-start;gap:12px;padding:14px 16px">
+              <span style="font-size:22px">🔗</span>
+              <div style="text-align:left">
+                <div style="font-weight:500">链接导入</div>
+                <div style="font-size:12px;color:var(--text3);margin-top:2px">输入 JSON 文件的网络地址</div>
+              </div>
+            </button>
+          </div>
+          <button class="btn btn-outline btn-block" style="margin-top:12px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        </div>`;
+      ov.onclick = e => { if (e.target === ov) { ov.remove(); resolve(); } };
+      ov.querySelector('#import-local-btn').onclick = () => {
+        ov.remove();
+        Actions._doLocalImport();
+        resolve();
+      };
+      ov.querySelector('#import-url-btn').onclick = () => {
+        ov.remove();
+        Actions._doUrlImport();
+        resolve();
+      };
+      document.body.appendChild(ov);
+    });
+  },
+
+  async _doLocalImport() {
     const input = document.getElementById('import-input');
     input.onchange = async (e) => {
       const file = e.target.files[0];
@@ -3203,6 +3293,136 @@ const Actions = {
       }
     };
     input.click();
+  },
+
+  async _doUrlImport() {
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay center';
+    ov.innerHTML = `
+      <div class="modal-dialog" style="max-width:340px">
+        <div class="modal-title" style="margin-bottom:8px">🔗 链接导入</div>
+        <div style="font-size:12px;color:var(--warn);background:var(--warn-light);border-radius:8px;padding:8px 10px;margin-bottom:12px">
+          ⚠️ 必须填写 JSON 文件的<b>下载直链</b>，不支持网页链接
+        </div>
+        <input class="form-input" id="url-import-input" placeholder="https://example.com/quiz.json" style="margin-bottom:14px">
+        <div style="display:flex;gap:10px">
+          <button class="btn btn-outline flex-1" onclick="this.closest('.modal-overlay').remove()">取消</button>
+          <button class="btn btn-primary flex-1" id="url-import-ok">连接并检测</button>
+        </div>
+      </div>`;
+    ov.onclick = e => { if (e.target === ov) ov.remove(); };
+    document.body.appendChild(ov);
+    setTimeout(() => ov.querySelector('#url-import-input')?.focus(), 100);
+
+    ov.querySelector('#url-import-ok').onclick = async () => {
+      const url = ov.querySelector('#url-import-input').value.trim();
+      if (!url) { Utils.toast('请输入URL'); return; }
+      if (!url.startsWith('http')) { Utils.toast('请输入完整的 http/https 地址'); return; }
+      ov.remove();
+
+      // 显示"正在连接"状态（15s 超时）
+      const loading = document.createElement('div');
+      loading.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center';
+      loading.innerHTML = `<div class="modal-dialog" style="text-align:center;padding:24px 32px;min-width:220px">
+        <div style="font-size:32px;margin-bottom:8px">🔗</div>
+        <div style="font-size:15px;font-weight:500;color:var(--text)" id="loading-msg">正在尝试连接...</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:6px">超时时间 15 秒</div>
+      </div>`;
+      document.body.appendChild(loading);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+      let text, filename;
+      try {
+        const resp = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!resp.ok) throw new Error('服务器返回 ' + resp.status);
+
+        // 从 URL 提取文件名
+        let filename = decodeURIComponent(url.split('/').pop().split('?')[0]) || 'quiz.json';
+        if (!filename.endsWith('.json')) filename += '.json';
+
+        loading.querySelector('#loading-msg').textContent = '正在读取文件...';
+        text = await resp.text();
+
+        // 检验 JSON 格式
+        let data;
+        try { data = JSON.parse(text); } catch(e) {
+          loading.remove();
+          Utils.toast('❌ 该链接内容不是有效的 JSON 格式，无法导入');
+          return;
+        }
+        if (!data.folders && !data.questions) {
+          loading.remove();
+          Utils.toast('❌ JSON 格式不符合题库格式要求');
+          return;
+        }
+
+        loading.remove();
+
+        // 确认下载弹窗，显示文件名
+        const ok = await Utils.confirm(
+          '确认下载',
+          `检测到文件：
+📄 ${filename}
+
+确认下载并导入题库？`,
+          '确认下载', false
+        );
+        if (!ok) return;
+
+        // 导入
+        let count = 0;
+        if (data.folders) {
+          for (const f of data.folders) {
+            const folders = await DB.getFolders();
+            let folder = folders.find(x => x.name === f.name);
+            if (!folder) {
+              const id = await DB.saveFolder({ name: f.name, createdAt: Date.now() });
+              folder = { id, name: f.name };
+            }
+            for (const q of (f.questions || [])) {
+              const answers = q.answers && q.answers.length ? q.answers : (q.answer ? [String(q.answer)] : []);
+              await DB.saveQuestion({
+                folderId: folder.id, type: q.type||'填空',
+                question: q.question||'', options: q.options,
+                answer: String(q.answer||''), answers,
+                explanation: q.explanation||'',
+                wrongCount:0, rightCount:0, weight:1, starred:false, createdAt:Date.now()
+              });
+              count++;
+            }
+          }
+        } else if (data.questions) {
+          const folders = await DB.getFolders();
+          let folder = folders[0];
+          if (!folder) {
+            const id = await DB.saveFolder({ name: '导入题库', createdAt: Date.now() });
+            folder = { id };
+          }
+          for (const q of data.questions) {
+            await DB.saveQuestion({
+              folderId: folder.id, type: q.type||'填空',
+              question: q.question||'', options: q.options,
+              answer: String(q.answer||''), explanation: q.explanation||'',
+              wrongCount:0, rightCount:0, weight:1, starred:false, createdAt:Date.now()
+            });
+            count++;
+          }
+        }
+        Utils.toast(`✅ 成功导入 ${count} 道题目`);
+        await Nav.refreshHome();
+      } catch(err) {
+        clearTimeout(timeoutId);
+        loading.remove();
+        if (err.name === 'AbortError') {
+          Utils.toast('⏱️ 连接超时（15秒），请检查链接是否有效');
+        } else {
+          Utils.toast('❌ 连接失败：' + (err.message || '网络错误'));
+        }
+      }
+    };
   },
 
   // 导出JSON
@@ -3632,12 +3852,23 @@ const Actions = {
    拦截手机物理返回键 → 返回首页
    ========================================================= */
 window.addEventListener('popstate', (e) => {
-  // 阻止默认返回行为
-  history.pushState(null, '', location.href);
   const app = document.getElementById('app');
   const pages = app.querySelectorAll('.page');
-  if (pages.length > 1) Nav.pop();
-  // 如果已在首页，什么都不做（阻止退出）
+  if (pages.length <= 1) {
+    // 已在首页，再加一条历史防止意外退出浏览器
+    history.pushState(null, '', location.href);
+    return;
+  }
+  // 做题页：用退出确认弹窗而非直接 pop
+  const top = pages[pages.length - 1];
+  if (top && top._isQuizPage) {
+    history.pushState(null, '', location.href);
+    top._quit(); // 触发退出确认弹窗
+    return;
+  }
+  // 其他页面：正常返回
+  history.pushState(null, '', location.href);
+  Nav.pop();
 });
 
 /* =========================================================
