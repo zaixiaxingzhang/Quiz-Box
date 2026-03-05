@@ -687,6 +687,7 @@ input, textarea, select { font-family: inherit; color: var(--text); background: 
   -webkit-backdrop-filter: blur(4px);
   animation: fadeIn 0.2s ease;
 }
+.modal-overlay { justify-content: center; }
 .modal-overlay.center { align-items: center; padding: 20px; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .modal-sheet {
@@ -1113,10 +1114,31 @@ const DB = (() => {
 const State = {
   darkMode: false,
   points: 0,
-  pageStack: [],         // [{type, params}]
+  pageStack: [],
   searchQuery: '',
   batchMode: false,
   batchSelected: new Set(),
+  studyTimer: null,
+  studySecCount: 0,
+};
+
+// 学习计时器：只在做题/考试页计时，每满60秒自动写入一次
+const StudyTimer = {
+  start() {
+    if (State.studyTimer) return;
+    State.studyTimer = setInterval(async () => {
+      State.studySecCount = (State.studySecCount || 0) + 1;
+      if (State.studySecCount >= 60) {
+        State.studySecCount = 0;
+        const cur = (await DB.getMeta('studyMinutes')) || 0;
+        await DB.setMeta('studyMinutes', cur + 1);
+      }
+    }, 1000);
+  },
+  stop() {
+    if (State.studyTimer) { clearInterval(State.studyTimer); State.studyTimer = null; }
+    State.studySecCount = 0;
+  }
 };
 
 /* =========================================================
@@ -1131,40 +1153,45 @@ const Utils = {
     return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
   },
   // 从数组按权重随机抽取
-  weightedSample(items, n, mode = 'weighted') {
-    const pool = [...items];
-    const result = [];
-    // 关键修复：limit 在循环外计算一次，避免 pool.length 缩短导致提前终止
-    const limit = Math.min(n, pool.length);
-
-    if (mode === 'unseen') {
-      // 做完优先：未做过的题优先，再从剩余权重抽取
-      const unseen = pool.filter(x => !x.rightCount && !x.wrongCount);
-      const seen   = pool.filter(x =>  x.rightCount ||  x.wrongCount);
-      // 先从未做过里随机抽，不够再从 seen 里按权重抽
-      const unseenShuffled = unseen.sort(() => Math.random() - 0.5);
-      for (let i = 0; i < Math.min(limit, unseenShuffled.length); i++) {
-        result.push(unseenShuffled[i]);
-      }
-      if (result.length < limit) {
-        const seenSample = Utils.weightedSample(seen, limit - result.length, 'weighted');
-        result.push(...seenSample);
-      }
-      return result;
+  srsUpdate(q, grade) {
+    const now = Date.now();
+    let ef  = q.srsEase     != null ? q.srsEase     : 2.5;
+    let ivl = q.srsInterval != null ? q.srsInterval : 0;
+    let lvl = q.srsLevel    != null ? q.srsLevel    : 0;
+    if (grade >= 3) {
+      if (lvl === 0)      ivl = 1440;
+      else if (lvl === 1) ivl = 5760;
+      else                ivl = Math.round(ivl * ef);
+      lvl++;
+      ef = ef + 0.1 - (5 - grade) * (0.08 + (5 - grade) * 0.02);
+      ef = Math.max(1.3, parseFloat(ef.toFixed(3)));
+    } else {
+      ivl = 10; lvl = 0;
+      ef  = Math.max(1.3, parseFloat((ef - 0.2).toFixed(3)));
     }
-
-    // 默认：权重优先（学会的题少出）
-    for (let i = 0; i < limit; i++) {
-      const total = pool.reduce((s, x) => s + (x.weight || 1), 0);
-      let r = Math.random() * total;
-      let idx = pool.length - 1; // fallback 最后一项，避免浮点误差漏掉
-      for (let j = 0; j < pool.length; j++) {
-        r -= (pool[j].weight || 1);
-        if (r <= 0) { idx = j; break; }
-      }
-      result.push(pool.splice(idx, 1)[0]);
-    }
-    return result;
+    return {
+      srsLevel: lvl, srsInterval: ivl, srsEase: ef,
+      srsLastReview: now, srsNextReview: now + ivl * 60000,
+      wrongCount: grade < 3 ? (q.wrongCount||0)+1 : (q.wrongCount||0),
+      rightCount: grade >= 3 ? (q.rightCount||0)+1 : (q.rightCount||0),
+    };
+  },
+  srsSample(items, n) {
+    const now = Date.now();
+    const fresh  = items.filter(x => !x.srsNextReview);
+    const due    = items.filter(x => x.srsNextReview && x.srsNextReview <= now).sort((a,b) => a.srsNextReview - b.srsNextReview);
+    const notDue = items.filter(x => x.srsNextReview && x.srsNextReview > now).sort((a,b) => a.srsNextReview - b.srsNextReview);
+    return [...due, ...fresh, ...notDue].slice(0, Math.min(n, items.length));
+  },
+  unseenSample(items, n) {
+    const unseen = items.filter(x => !x.rightCount && !x.wrongCount).sort(() => Math.random()-0.5);
+    const seen   = items.filter(x =>  x.rightCount ||  x.wrongCount).sort(() => Math.random()-0.5);
+    return [...unseen, ...seen].slice(0, Math.min(n, items.length));
+  },
+  weightedSample(items, n, mode = 'srs') {
+    if (mode === 'srs')    return Utils.srsSample(items, n);
+    if (mode === 'unseen') return Utils.unseenSample(items, n);
+    return [...items].sort(() => Math.random()-0.5).slice(0, Math.min(n, items.length));
   },
   // HTML转义
   esc(s) {
@@ -1465,7 +1492,7 @@ const Pages = {
         <span class="appbar-title">${Utils.esc(title)}</span>
         <div class="appbar-actions">
           ${extraButtons}
-          <button class="appbar-btn" onclick="Actions.showContact()" title="技术沟通"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2,4 12,13 22,4"/></svg></button>
+          <button class="appbar-btn" onclick="Nav.push('settings',{})" title="设置"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
           <button class="appbar-btn" onclick="Actions.importJSON()" title="导入">${Icons.import}</button>
           <button class="appbar-btn" onclick="Actions.exportJSON()" title="导出">${Icons.export}</button>
           <button class="appbar-btn" id="theme-btn" onclick="Actions.toggleTheme()" title="切换主题">
@@ -1513,6 +1540,8 @@ const Pages = {
       case 'exam':      return Pages.renderExam(params);
       case 'fav':       return Pages.renderFav(params);
       case 'stats':     return Pages.renderStats(params);
+      case 'settings':  return Pages.renderSettings(params);
+      case 'srsAnalysis': return Pages.renderSrsAnalysis(params);
       case 'search':    return Pages.renderSearch(params);
       case 'quiz':      return Pages.renderQuiz(params);
       default:          return Pages.renderBank(params);
@@ -1535,7 +1564,7 @@ const Pages = {
           <span>刷题宝</span>
         </div>
         <div class="appbar-actions">
-          <button class="appbar-btn" onclick="Actions.showContact()" title="技术沟通"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2,4 12,13 22,4"/></svg></button>
+          <button class="appbar-btn" onclick="Nav.push('settings',{})" title="设置"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
           <button class="appbar-btn" onclick="Actions.importJSON()" title="导入">${Icons.import}</button>
           <button class="appbar-btn" onclick="Actions.exportJSON()" title="导出">${Icons.export}</button>
           <button class="appbar-btn" id="theme-btn" onclick="Actions.toggleTheme()" title="切换主题">
@@ -1575,7 +1604,7 @@ const Pages = {
       <div class="home-tile" onclick="Nav.push('review',{})">
         <div class="home-tile-icon" style="background:var(--accent-light)">${Icons.refresh.replace('currentColor','var(--accent)')}</div>
         <div class="home-tile-title">学习</div>
-        <div class="home-tile-sub">权重抽题</div>
+        <div class="home-tile-sub">算法选题</div>
       </div>
       <div class="home-tile" onclick="Nav.push('exam',{})">
         <div class="home-tile-icon" style="background:var(--warn-light)">${Icons.trophy.replace('currentColor','var(--warn)')}</div>
@@ -1599,6 +1628,7 @@ const Pages = {
         <div class="home-tile-title">统计</div>
         <div class="home-tile-sub">学习报告</div>
       </div>
+
     `;
   },
 
@@ -1833,8 +1863,8 @@ const Pages = {
             if (batchSet.has(qid)) batchSet.delete(qid); else batchSet.add(qid);
             render();
           } else {
-            const idx = qs.findIndex(q => q.id === qid);
-            Nav.push('quiz', { questions: qs, startIdx: idx, mode: 'practice' });
+            const q = allQs.find(x => x.id === qid);
+            if (q) Actions._showQDetail(q, () => render());
           }
         };
         const starBtn = card.querySelector('.star-btn');
@@ -1899,6 +1929,8 @@ const Pages = {
             <span class="tag ${typeColors[q.type]||'tag-neutral'}">${q.type}</span>
             ${q.wrongCount>0?`<span class="tag tag-danger">错${q.wrongCount}次</span>`:''}
             ${q.rightCount>0?`<span class="tag tag-success">对${q.rightCount}次</span>`:''}
+            ${q.note?`<span class="tag tag-warn">✏️笔记</span>`:''}
+            ${q.srsLastReview?`<span class="tag tag-neutral" style="font-size:10px">上次:${new Date(q.srsLastReview).toLocaleDateString('zh')}</span>`:''}
           </div>
             <button onclick="event.stopPropagation();Nav.push('editQ',{folderId:${q.folderId},qId:${q.id}})" 
               style="color:var(--accent);padding:4px 8px;font-size:13px;display:flex;align-items:center;gap:3px;border:1px solid var(--accent-light);border-radius:6px;background:var(--accent-light)">${Icons.edit} <span style="font-size:12px">编辑</span></button>
@@ -2203,7 +2235,7 @@ const Pages = {
 
     async function refresh() {
       const qs = await DB.getAllQuestions();
-      const wrongQs = qs.filter(q => q.wrongCount > 0 && (q.weight || 1) > 1).sort((a,b) => b.wrongCount - a.wrongCount);
+      const wrongQs = qs.filter(q => q.wrongCount > 0).sort((a,b) => b.wrongCount - a.wrongCount);
       if (!wrongQs.length) {
         content.innerHTML = `
           <div class="empty-state">
@@ -2253,9 +2285,16 @@ const Pages = {
       const allQs = await DB.getAllQuestions();
       content.innerHTML = `
         <div class="stat-card">
-          <div class="stat-row"><span class="stat-label">总题数</span><span class="stat-val">${allQs.length}</span></div>
-          <div class="stat-row"><span class="stat-label">有权重题目</span><span class="stat-val">${allQs.filter(q=>q.weight>1).length}</span></div>
-          <div class="stat-row"><span class="stat-label">错题数</span><span class="stat-val text-danger">${allQs.filter(q=>q.wrongCount>0).length}</span></div>
+          ${(() => {
+            const now = Date.now();
+            const due = allQs.filter(q => q.srsNextReview && q.srsNextReview <= now).length;
+            const fresh = allQs.filter(q => !q.srsNextReview).length;
+            return `
+              <div class="stat-row"><span class="stat-label">总题数</span><span class="stat-val">${allQs.length}</span></div>
+              <div class="stat-row"><span class="stat-label">今日待复习</span><span class="stat-val text-danger">${due}</span></div>
+              <div class="stat-row"><span class="stat-label">新题（未做过）</span><span class="stat-val">${fresh}</span></div>
+              <div class="stat-row"><span class="stat-label">错题数</span><span class="stat-val text-danger">${allQs.filter(q=>q.wrongCount>0).length}</span></div>`;
+          })()}
         </div>
         <div class="card">
           <div class="card-header"><span class="card-title">选择范围</span></div>
@@ -2284,16 +2323,16 @@ const Pages = {
             <label class="form-label">抽题模式</label>
             <div style="display:flex;flex-direction:column;gap:8px">
               <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;border:1.5px solid var(--border);border-radius:var(--radius3);cursor:pointer" id="mode-weighted-row">
-                <input type="radio" name="sample-mode" value="weighted" checked style="margin-top:2px;accent-color:var(--accent)">
+                <input type="radio" name="sample-mode" value="srs" checked style="margin-top:2px;accent-color:var(--accent)">
                 <div>
-                  <div style="font-size:14px;font-weight:500;color:var(--text)">权重优先</div>
+                  <div style="font-size:14px;font-weight:500;color:var(--text)">SRS（间隔重复）</div>
                   <div style="font-size:12px;color:var(--text3);margin-top:2px">答错多的题优先出现，已学会的题少出现</div>
                 </div>
               </label>
               <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;border:1.5px solid var(--border);border-radius:var(--radius3);cursor:pointer" id="mode-unseen-row">
                 <input type="radio" name="sample-mode" value="unseen" style="margin-top:2px;accent-color:var(--accent)">
                 <div>
-                  <div style="font-size:14px;font-weight:500;color:var(--text)">做完优先</div>
+                  <div style="font-size:14px;font-weight:500;color:var(--text)">新题优先</div>
                   <div style="font-size:12px;color:var(--text3);margin-top:2px">未做过的题优先出现，保证覆盖所有题目</div>
                 </div>
               </label>
@@ -2316,7 +2355,7 @@ const Pages = {
         if (!pool.length) { Utils.toast('所选范围无题目'); return; }
         const count = Math.min(parseInt(content.querySelector('#review-count').value)||20, pool.length);
         const modeEl = content.querySelector('input[name="sample-mode"]:checked');
-        const sampleMode = modeEl ? modeEl.value : 'weighted';
+        const sampleMode = modeEl ? modeEl.value : 'srs';
         const questions = Utils.weightedSample(pool, count, sampleMode);
         Nav.push('quiz', { questions, startIdx: 0, mode: 'review' });
       };
@@ -2462,7 +2501,11 @@ const Pages = {
       const totalAnswered = (await DB.getMeta('totalAnswered')) || 0;
       const totalRight = (await DB.getMeta('totalRight')) || 0;
       const totalWrong = (await DB.getMeta('totalWrong')) || 0;
+      const studyMinutes = (await DB.getMeta('studyMinutes')) || 0;
       const acc = totalAnswered > 0 ? Math.round(totalRight / totalAnswered * 100) : 0;
+      const studyHours = Math.floor(studyMinutes / 60);
+      const studyMins = studyMinutes % 60;
+      const studyStr = studyHours > 0 ? `${studyHours}小时${studyMins}分钟` : `${studyMinutes}分钟`;
       const wrongQs = qs.filter(q => q.wrongCount > 0);
       const starred = qs.filter(q => q.starred);
 
@@ -2482,7 +2525,7 @@ const Pages = {
             <div style="margin-top:8px;font-size:13px;color:var(--text3)">累计积分</div>
           </div>
           <div style="background:var(--bg2);border-radius:var(--radius3);padding:10px 12px;margin:8px 0 4px;font-size:13px;color:var(--text2);line-height:1.7">
-            📖 练习模式：答对 <b>+2分</b>，答错 <b>+0分</b><br>
+            📖 练习模式：答对 <b>+2分</b>，答错 <b>+1分</b><br>
             📝 考试模式：每道题答对 <b>+3分</b>
           </div>
           <div class="divider"></div>
@@ -2490,12 +2533,23 @@ const Pages = {
           <div class="stat-row"><span class="stat-label">答对题数</span><span class="stat-val text-success">${totalRight}</span></div>
           <div class="stat-row"><span class="stat-label">答错题数</span><span class="stat-val text-danger">${totalWrong}</span></div>
           <div class="stat-row"><span class="stat-label">正确率</span><span class="stat-val">${acc}%</span></div>
+          <div class="stat-row"><span class="stat-label">累计学习时长</span><span class="stat-val">⏱️ ${studyStr}</span></div>
+          <div class="stat-row"><span class="stat-label">平均每题用时</span><span class="stat-val">${totalAnswered>0?Math.round(studyMinutes*60/totalAnswered)+'秒':'—'}</span></div>
         </div>
         <div class="stat-card">
           <div class="stat-row"><span class="stat-label">题库总题数</span><span class="stat-val">${qs.length}</span></div>
           <div class="stat-row"><span class="stat-label">错题数</span><span class="stat-val text-danger">${wrongQs.length}</span></div>
           <div class="stat-row"><span class="stat-label">收藏数</span><span class="stat-val">${starred.length}</span></div>
           <div class="stat-row"><span class="stat-label">文件夹数</span><span class="stat-val">${folders.length}</span></div>
+        </div>
+        <div class="section-title">SRS 算法分析</div>
+        <div class="card" onclick="Nav.push('srsAnalysis',{})" style="display:flex;align-items:center;gap:12px;padding:14px 16px;cursor:pointer;margin-bottom:4px">
+          <div style="font-size:24px">🧠</div>
+          <div style="flex:1">
+            <div style="font-size:15px;font-weight:600;color:var(--text)">查看题目掌握情况</div>
+            <div style="font-size:12px;color:var(--text3);margin-top:2px">按已掌握 / 待加强分类排序</div>
+          </div>
+          <div style="color:var(--text3);font-size:20px">›</div>
         </div>
         ${folderStats.length ? `
           <div class="section-title">各文件夹</div>
@@ -2524,6 +2578,393 @@ const Pages = {
       `;
     }
     load();
+    return el;
+  },
+
+  /* =====================================================
+     SRS 分析页
+     ===================================================== */
+  renderSrsAnalysis(params) {
+    const el = Pages.createPage('SRS 算法分析');
+
+    // ── Tab bar（固定在顶部，不随内容滚动）──────────────────────────
+    const tabWrap = document.createElement('div');
+    tabWrap.style.cssText = 'padding:10px 14px 0;background:var(--bg);flex-shrink:0;';
+    tabWrap.innerHTML = `
+      <div style="display:flex;background:var(--surface2);border-radius:12px;padding:3px;gap:2px" id="srs-tabbar">
+        <button data-tab="struggling" style="flex:1;padding:9px 0;border-radius:9px;font-size:14px;font-weight:600;transition:all .2s;background:var(--card);box-shadow:0 1px 4px rgba(0,0,0,.1)">
+          学习中 <span id="cnt-struggling" style="font-size:12px;font-weight:400"></span>
+        </button>
+        <button data-tab="mastered" style="flex:1;padding:9px 0;border-radius:9px;font-size:14px;font-weight:600;transition:all .2s;color:var(--text3);background:transparent">
+          已掌握 <span id="cnt-mastered" style="font-size:12px;font-weight:400"></span>
+        </button>
+      </div>
+      <div id="srs-indicator" style="display:flex;gap:4px;justify-content:center;margin-top:8px">
+        <div style="width:20px;height:3px;border-radius:2px;background:var(--accent);transition:all .3s" id="dot-0"></div>
+        <div style="width:8px;height:3px;border-radius:2px;background:var(--border);transition:all .3s" id="dot-1"></div>
+      </div>`;
+    el.appendChild(tabWrap);
+
+    // ── Swipe container ────────────────────────────────────────────
+    const swipeWrap = document.createElement('div');
+    swipeWrap.style.cssText = 'flex:1;overflow:hidden;position:relative;';
+
+    const track = document.createElement('div');
+    track.style.cssText = 'display:flex;width:200%;height:100%;transition:transform .28s cubic-bezier(.4,0,.2,1);will-change:transform;';
+
+    const panel0 = document.createElement('div'); // 学习中
+    panel0.style.cssText = 'width:50%;height:100%;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px 14px 30px;box-sizing:border-box;';
+    const panel1 = document.createElement('div'); // 已掌握
+    panel1.style.cssText = 'width:50%;height:100%;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px 14px 30px;box-sizing:border-box;';
+
+    track.appendChild(panel0);
+    track.appendChild(panel1);
+    swipeWrap.appendChild(track);
+    el.appendChild(swipeWrap);
+
+    let curTab = 0; // 0=学习中, 1=已掌握
+
+    function switchTab(idx, animate = true) {
+      curTab = idx;
+      if (!animate) track.style.transition = 'none';
+      track.style.transform = `translateX(${idx === 0 ? '0' : '-50%'})`;
+      if (!animate) requestAnimationFrame(() => { track.style.transition = 'transform .28s cubic-bezier(.4,0,.2,1)'; });
+
+      // Tab bar 样式
+      tabWrap.querySelectorAll('[data-tab]').forEach((btn, i) => {
+        const active = i === idx;
+        btn.style.background = active ? 'var(--card)' : 'transparent';
+        btn.style.boxShadow = active ? '0 1px 4px rgba(0,0,0,.1)' : 'none';
+        btn.style.color = active ? (idx === 0 ? 'var(--accent)' : 'var(--success)') : 'var(--text3)';
+      });
+
+      // 指示点
+      document.getElementById('dot-0').style.cssText = `width:${curTab===0?'20px':'8px'};height:3px;border-radius:2px;background:${curTab===0?'var(--accent)':'var(--border)'};transition:all .3s`;
+      document.getElementById('dot-1').style.cssText = `width:${curTab===1?'20px':'8px'};height:3px;border-radius:2px;background:${curTab===1?'var(--success)':'var(--border)'};transition:all .3s`;
+    }
+
+    // Tab 点击
+    tabWrap.querySelectorAll('[data-tab]').forEach((btn, i) => {
+      btn.onclick = () => switchTab(i);
+    });
+
+    // Touch swipe
+    let tx0 = 0, ty0 = 0, swiping = false;
+    swipeWrap.addEventListener('touchstart', e => {
+      tx0 = e.touches[0].clientX;
+      ty0 = e.touches[0].clientY;
+      swiping = false;
+    }, { passive: true });
+    swipeWrap.addEventListener('touchmove', e => {
+      const dx = e.touches[0].clientX - tx0;
+      const dy = e.touches[0].clientY - ty0;
+      if (!swiping && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 8) {
+        swiping = true;
+      }
+      if (swiping) e.preventDefault();
+    }, { passive: false });
+    swipeWrap.addEventListener('touchend', e => {
+      if (!swiping) return;
+      const dx = e.changedTouches[0].clientX - tx0;
+      if (dx < -40 && curTab === 0) switchTab(1);
+      else if (dx > 40 && curTab === 1) switchTab(0);
+    });
+
+    function card(q) {
+      const ivlMin = q.srsInterval || 0;
+      const ivlStr = ivlMin < 60 ? `${ivlMin}分钟`
+        : ivlMin < 1440 ? `${(ivlMin/60).toFixed(1)}小时`
+        : `${(ivlMin/1440).toFixed(1)}天`;
+      const ef = (q.srsEase||2.5).toFixed(2);
+      const efColor = (q.srsEase||2.5) < 2.0 ? 'tag-danger' : (q.srsEase||2.5) < 2.4 ? 'tag-warn' : 'tag-success';
+      return `<div class="q-card" style="margin-bottom:8px">
+        <div class="q-card-text" style="font-size:13px;margin-bottom:6px">${Utils.esc(q.question.slice(0,80))}${q.question.length>80?'…':''}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <span class="tag tag-neutral" style="font-size:10px">Lv.${q.srsLevel||0}</span>
+          <span class="tag tag-neutral" style="font-size:10px">间隔 ${ivlStr}</span>
+          <span class="tag ${efColor}" style="font-size:10px">难度 ${ef}</span>
+          ${(q.rightCount||0)>0?`<span class="tag tag-success" style="font-size:10px">✓ ${q.rightCount}</span>`:''}
+          ${(q.wrongCount||0)>0?`<span class="tag tag-danger" style="font-size:10px">✗ ${q.wrongCount}</span>`:''}
+        </div>
+      </div>`;
+    }
+
+    async function load() {
+      const qs = await DB.getAllQuestions();
+      const mastered = qs
+        .filter(q => (q.rightCount||0) > 0 && (q.wrongCount||0) === 0 && (q.srsLevel||0) >= 2)
+        .sort((a,b) => (b.rightCount||0) - (a.rightCount||0));
+      const struggling = qs
+        .filter(q => (q.wrongCount||0) > 0 || ((q.srsEase||2.5) < 2.5 && q.srsLastReview))
+        .sort((a,b) => (a.srsEase||2.5) - (b.srsEase||2.5));
+
+      document.getElementById('cnt-struggling').textContent = `(${struggling.length})`;
+      document.getElementById('cnt-mastered').textContent = `(${mastered.length})`;
+
+      panel0.innerHTML = struggling.length
+        ? struggling.slice(0,100).map(card).join('') + (struggling.length>100?`<div style="text-align:center;font-size:12px;color:var(--text3);padding:10px">共 ${struggling.length} 道，显示前100</div>`:'')
+        : '<div class="empty-state"><div class="empty-sub">暂无学习中的题目 🎉</div></div>';
+
+      panel1.innerHTML = mastered.length
+        ? mastered.slice(0,100).map(card).join('') + (mastered.length>100?`<div style="text-align:center;font-size:12px;color:var(--text3);padding:10px">共 ${mastered.length} 道，显示前100</div>`:'')
+        : '<div class="empty-state"><div class="empty-sub">还没有已掌握的题目，加油！</div></div>';
+
+      switchTab(0, false);
+    }
+    load();
+    return el;
+  },
+
+  /* =====================================================
+     设置页
+     ===================================================== */
+  renderSettings(params) {
+    const el = Pages.createPage('设置');
+    const content = document.createElement('div');
+    content.className = 'page-content';
+    el.appendChild(content);
+
+    function section(id, emoji, title, bodyHtml) {
+      return `
+        <div class="card" style="margin-bottom:10px;overflow:hidden">
+          <div onclick="(function(b){b.style.display=b.style.display==='none'?'block':'none'})(document.getElementById('${id}'))"
+               style="display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer">
+            <span style="font-size:20px">${emoji}</span>
+            <span style="flex:1;font-size:15px;font-weight:600;color:var(--text)">${title}</span>
+            <span style="color:var(--text3);font-size:20px;line-height:1">›</span>
+          </div>
+          <div id="${id}" style="display:none;border-top:1px solid var(--border);padding:14px 16px">${bodyHtml}</div>
+        </div>`;
+    }
+
+    const preStyle = 'background:var(--surface2);border-radius:8px;padding:12px;font-size:11.5px;overflow-x:auto;line-height:1.6;color:var(--text2);white-space:pre-wrap;word-break:break-all';
+    const h3 = 'font-size:13px;font-weight:600;color:var(--text);margin:12px 0 6px';
+    const p = 'font-size:13px;color:var(--text2);line-height:1.7;margin-bottom:10px';
+
+    const formatBody = `
+      <p style="${p}">刷题宝使用 JSON 文件导入题库，支持四种题型。文件编码 UTF-8，后缀 .json。</p>
+      <div style="${h3}">📁 整体结构</div>
+      <pre style="${preStyle}">{
+  "folders": [
+    {
+      "name": "文件夹名称",
+      "questions": [ ...题目数组 ]
+    }
+  ]
+}</pre>
+      <div style="${h3}">✏️ 填空题</div>
+      <pre style="${preStyle}">{
+  "type": "填空",
+  "question": "PLC 的英文全称是？",
+  "answer": "Programmable Logic Controller",
+  "answers": ["可编程逻辑控制器","PLC"],
+  "explanation": "解析可选"
+}</pre>
+      <div style="${h3}">✅ 判断题</div>
+      <pre style="${preStyle}">{
+  "type": "判断",
+  "question": "梯形图中线圈不能并联。",
+  "answer": "错误"
+}</pre>
+      <div style="${h3}">🔘 单选题</div>
+      <pre style="${preStyle}">{
+  "type": "单选",
+  "question": "PLC 按结构分为哪两类？",
+  "options": ["整体式和模块式","串联式和并联式","数字式和模拟式"],
+  "answer": "A",
+  "explanation": "解析可选"
+}</pre>
+      <div style="${h3}">☑️ 多选题</div>
+      <pre style="${preStyle}">{
+  "type": "多选",
+  "question": "PLC 主要编程语言有哪些？",
+  "options": ["梯形图","指令表","顺序功能图","流程图"],
+  "answer": "ABC"
+}</pre>
+      <div style="font-size:12px;color:var(--text3);margin-top:10px;line-height:1.7">
+        💡 必填字段：type / question / answer。单选/多选必须有 options。explanation（解析）所有题型可选。answers（备选答案）仅填空题可用。
+      </div>`;
+
+    const promptFull = `请将下面的题库整理为标准 JSON 格式。
+
+必须严格遵守以下规则：
+
+一、输出要求
+1. 只输出合法 JSON
+2. 不要添加任何解释、说明、Markdown 标记或额外文字
+3. 输出必须是完整 JSON 文件内容
+
+二、整体结构
+{
+  "folders": [
+    {
+      "name": "文件夹名称",
+      "questions": [ 题目数组 ]
+    }
+  ]
+}
+说明：如果未分类，name 写为"默认分类"
+
+三、题型规则
+
+1. 填空题
+{
+  "type": "填空",
+  "question": "题目内容",
+  "answer": "主答案",
+  "answers": ["备选答案1", "备选答案2"]
+}
+
+2. 判断题
+{
+  "type": "判断",
+  "question": "题目内容",
+  "answer": "正确"
+}
+answer 只能是"正确"或"错误"
+
+3. 单选题
+{
+  "type": "单选",
+  "question": "题目内容",
+  "options": ["选项1", "选项2", "选项3"],
+  "answer": "A"
+}
+answer 使用字母 A-Z，第一个选项是 A
+
+4. 多选题
+{
+  "type": "多选",
+  "question": "题目内容",
+  "options": ["选项1", "选项2", "选项3"],
+  "answer": "ABC"
+}
+
+四、禁止事项
+- 不要添加多余字段
+- 不要生成 null 或空数组字段
+- 不要输出 Markdown 代码块
+
+现在开始转换下面的原始题库：
+
+【把你的题目粘贴到这里】`;
+
+    const aiBody = `
+      <p style="${p}">把任意格式的题目（Word 复制、截图 OCR、手打文字）发给 AI，配上下面的提示词，AI 会自动转成可直接导入的 JSON 文件。</p>
+      <div style="${h3}">使用步骤</div>
+      <div style="font-size:13px;color:var(--text2);line-height:2.2">
+        1️⃣ 点击下方按钮复制提示词<br>
+        2️⃣ 粘贴到 ChatGPT / Kimi / 文心一言 等 AI<br>
+        3️⃣ 把你的原始题目接在提示词末尾<br>
+        4️⃣ AI 输出 JSON 后保存为 .json 文件<br>
+        5️⃣ 导入刷题宝即可
+      </div>
+      <button class="btn btn-primary btn-block" style="margin-top:12px" id="copy-prompt-btn">📋 复制 AI 提示词</button>`;
+
+    const srsBody = `
+      <p style="${p}">SRS（Spaced Repetition System，间隔重复学习系统）是一种科学的记忆方法，被 Anki、Duolingo 等学习软件广泛使用。</p>
+      <div style="${h3}">📖 核心原理：遗忘曲线</div>
+      <p style="${p}">人脑对新知识的记忆会随时间衰减，但每次在即将遗忘时复习，记忆就会强化，下次遗忘的速度也会变慢。SRS 计算每道题的最佳复习时机，让你花最少时间记住最多内容。</p>
+      <div style="${h3}">⚙️ SM-2 算法参数</div>
+      <div style="background:var(--surface2);border-radius:8px;padding:12px;font-size:12px;color:var(--text2);line-height:2.1;margin-bottom:10px">
+        🔢 <b>记忆等级（Level）</b>：从 0 开始，连续答对则升级<br>
+        ⏱️ <b>复习间隔（Interval）</b>：下次复习的时间，随等级指数增长<br>
+        📈 <b>难度因子（Ease Factor）</b>：初始 2.5，答对增大、答错减小（最低 1.3）
+      </div>
+      <div style="${h3}">📐 间隔计算规则</div>
+      <div style="background:var(--surface2);border-radius:8px;padding:12px;font-size:12px;color:var(--text2);line-height:2.1;margin-bottom:10px">
+        <b>答对时：</b><br>
+        &nbsp;&nbsp;Lv.0 → 下次 1 天后<br>
+        &nbsp;&nbsp;Lv.1 → 下次 4 天后<br>
+        &nbsp;&nbsp;Lv.2+ → 下次 = 上次间隔 × 难度因子<br>
+        <b>答错 / 不会做：</b><br>
+        &nbsp;&nbsp;等级归零，10 分钟后再次出现，难度因子 -0.2
+      </div>
+      <div style="${h3}">📊 连续答对的间隔示例</div>
+      <div style="background:var(--surface2);border-radius:8px;padding:12px;font-size:12px;color:var(--text2);line-height:2.1;margin-bottom:10px">
+        第 1 次答对 → <b>1 天</b>后复习<br>
+        第 2 次答对 → <b>4 天</b>后复习<br>
+        第 3 次答对 → <b>约 10 天</b>后复习<br>
+        第 4 次答对 → <b>约 25 天</b>后复习<br>
+        真正掌握的题越来越少出现，精力集中在薄弱题目上
+      </div>
+      <div style="${h3}">🎯 SRS 抽题优先级</div>
+      <p style="${p}">学习模式每次抽题顺序：① 今日到期的题 → ② 新题（从未做过）→ ③ 还未到复习时间的题。这样最大化复习效率。</p>`;
+
+    const urlBody = `
+      <div style="${h3}">什么是下载直链？</div>
+      <div style="background:var(--success-light);border-radius:8px;padding:10px 12px;font-size:13px;color:var(--text2);line-height:1.8;margin-bottom:10px">
+        ✅ <b>直链（可以用）</b>：点击后浏览器<b>自动开始下载文件</b><br>
+        ❌ <b>非直链（不能用）</b>：点击后进入网盘或预览页，还需要再点"下载"
+      </div>
+      <div style="${h3}">常见直链来源</div>
+      <div style="font-size:13px;color:var(--text2);line-height:2.2">
+        ✅ GitHub Raw 链接（含 raw.githubusercontent.com）<br>
+        ✅ Gitee Raw 链接<br>
+        ✅ 服务器直接托管的 .json 文件<br>
+        💡 <b>网盘也能用！</b>在百度网盘/阿里云盘点击下载后，<b>复制浏览器地址栏中正在下载的链接</b>即为直链（通常很长，含 token 参数），粘贴到导入框即可
+      </div>
+      <div style="${h3}">如何获取 GitHub 直链</div>
+      <div style="font-size:13px;color:var(--text2);line-height:2.2">
+        1️⃣ 在 GitHub 打开你的 .json 文件<br>
+        2️⃣ 点击右上角 <b>Raw</b> 按钮<br>
+        3️⃣ 复制浏览器地址栏的链接即为直链
+      </div>
+      <div style="${h3}">导入步骤</div>
+      <div style="font-size:13px;color:var(--text2);line-height:2.2">
+        1️⃣ 点首页右上角 <b>导入</b> 按钮<br>
+        2️⃣ 选「🔗 链接导入」<br>
+        3️⃣ 粘贴直链，点「连接并检测」<br>
+        4️⃣ 确认文件名后点「确认下载」
+      </div>`;
+
+    content.innerHTML = `
+      <div class="section-title">使用教程</div>
+      ${section('s1','📋','题库 JSON 格式说明', formatBody)}
+      ${section('s2','🤖','AI 一键转换题库', aiBody)}
+      ${section('s3','🧠','SRS 间隔重复算法详解', srsBody)}
+      ${section('s4','🔗','链接导入使用教程', urlBody)}
+      <div class="section-title" style="margin-top:4px">关于</div>
+      <div class="card" style="padding:16px">
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
+          <div style="width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--accent),#6366f1);display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(99,102,241,0.35)">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              <line x1="9" y1="7" x2="15" y2="7"/>
+              <line x1="9" y1="11" x2="15" y2="11"/>
+            </svg>
+          </div>
+          <div>
+            <div style="font-size:16px;font-weight:700;color:var(--text)">刷题宝</div>
+            <div style="font-size:12px;color:var(--text3);margin-top:2px">v2.3 · SRS 间隔重复学习</div>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <div class="card-row" onclick="Actions.showContact()" style="cursor:pointer;padding:12px 0">
+          <div style="font-size:18px;margin-right:10px">✉️</div>
+          <div class="card-row-content">
+            <div class="card-row-title">技术沟通</div>
+            <div class="card-row-sub">QQ：1398124361 · 1398124361@qq.com</div>
+          </div>
+          <div style="color:var(--text3);font-size:20px">›</div>
+        </div>
+        <div style="padding-top:12px;border-top:1px solid var(--border);font-size:12px;color:var(--text3);text-align:center;line-height:1.8">
+          本网页由临沂市机电工程学校 23 级电气学生设计
+        </div>
+      </div>
+      <div style="height:20px"></div>
+    `;
+
+    // Copy prompt button
+    content.querySelector('#copy-prompt-btn')?.addEventListener('click', () => {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(promptFull).then(() => Utils.toast('✅ 提示词已复制，粘贴给 AI 即可'));
+      } else {
+        Utils.toast('请长按选中提示词手动复制');
+      }
+    });
+
     return el;
   },
 
@@ -2617,12 +3058,34 @@ const Pages = {
     el.style.display = 'flex';
     el.style.flexDirection = 'column';
     el._isQuizPage = true; // 标记为做题页，阻止 popstate 误触返回
+    StudyTimer.start(); // 进入做题/考试页面开始计时
 
     let curIdx = startIdx;
     let answered = false;
     let userAnswer = null;
     let answers = new Array(questions.length).fill(null); // 记录作答
     let examTimer = null;
+
+    // 预生成每道选择题的选项乱序（键=原始字母，值=新字母）
+    // 同时保存打乱后的 options 数组，避免每次渲染重新打乱
+    const shuffledOpts = questions.map(q => {
+      if ((q.type !== '单选' && q.type !== '多选') || !q.options || q.options.length < 2) return null;
+      const indices = q.options.map((_, i) => i);
+      // Fisher-Yates shuffle
+      for (let i = indices.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+      }
+      // indices[newPos] = oldPos
+      const newOptions = indices.map(oi => q.options[oi]);
+      // oldLetter -> newLetter mapping
+      const oldToNew = {};
+      indices.forEach((oldIdx, newIdx) => {
+        oldToNew[String.fromCharCode(65 + oldIdx)] = String.fromCharCode(65 + newIdx);
+      });
+      // newLetter -> old option text (for display)
+      return { options: newOptions, oldToNew };
+    });
     let examSecLeft = timeLimit * 60;
     let examStartTime = Date.now();
 
@@ -2681,38 +3144,50 @@ const Pages = {
       let multiSelected = (q.type === '多选' && Array.isArray(userAnswer)) ? [...userAnswer] : [];
 
       if (q.type === '单选') {
-        const opts = q.options || [];
+        const sh = shuffledOpts[curIdx];
+        const opts = sh ? sh.options : (q.options || []);
+        // 映射：如果有打乱，正确答案字母也要换算
+        const correctLetter = sh ? (sh.oldToNew[q.answer] || q.answer) : q.answer;
+        const displayAnswer = sh ? (sh.oldToNew[userAnswer] || userAnswer) : userAnswer;
         qBody = `<div class="option-list">
           ${opts.map((o, i) => {
             const letter = String.fromCharCode(65+i);
             let cls = '';
             if (isExam) {
-              // 考试模式：只显示"已选"，不显示对错
-              if (letter === userAnswer) cls = 'selected';
+              if (letter === displayAnswer) cls = 'selected';
             } else if (answered) {
-              if (letter === q.answer) cls = 'correct';
-              else if (letter === userAnswer && userAnswer !== q.answer) cls = 'wrong';
-            } else if (letter === userAnswer) cls = 'selected';
+              if (letter === correctLetter) cls = 'correct';
+              else if (letter === displayAnswer && displayAnswer !== correctLetter) cls = 'wrong';
+            } else if (letter === displayAnswer) cls = 'selected';
             return `<div class="option-item ${cls}" data-letter="${letter}">
               <div class="option-letter">${letter}</div>
               <div class="option-text">${Utils.esc(o)}</div>
-              ${!isExam && answered && letter === q.answer ? `<div style="margin-left:auto;color:var(--success)">${Icons.check}</div>` : ''}
+              ${!isExam && answered && letter === correctLetter ? `<div style="margin-left:auto;color:var(--success)">${Icons.check}</div>` : ''}
             </div>`;
           }).join('')}
         </div>`;
       } else if (q.type === '多选') {
-        const opts = q.options || [];
-        // 正确答案是字母字符串如 "ABC" 或数组
-        const correctLetters = Array.isArray(q.answer) ? q.answer : (q.answer||'').split('').filter(c => /[A-Z]/.test(c));
+        const sh = shuffledOpts[curIdx];
+        const opts = sh ? sh.options : (q.options || []);
+        // 正确答案字母集合（映射到打乱后的字母）
+        const origCorrect = Array.isArray(q.answer) ? q.answer : (q.answer||'').split('').filter(ch => /[A-Z]/.test(ch));
+        const correctLetters = sh ? origCorrect.map(l => sh.oldToNew[l] || l) : origCorrect;
+        // 用户已选（存的是原始字母，显示时转换）
+        const displaySelected = sh
+          ? multiSelected.map(l => sh.oldToNew[l] || l)
+          : multiSelected;
         qBody = `
           ${!answered ? '<div style="font-size:12px;color:var(--text3);margin-bottom:10px">多选题，选完后点击提交</div>' : ''}
           <div class="option-list" id="multi-opts">
           ${opts.map((o, i) => {
             const letter = String.fromCharCode(65+i);
             const isCorrectOpt = correctLetters.includes(letter);
+            const displayAns = sh && Array.isArray(userAnswer)
+              ? userAnswer.map(l => sh.oldToNew[l] || l)
+              : userAnswer;
             const userChose = answered
-              ? (Array.isArray(userAnswer) ? userAnswer.includes(letter) : (userAnswer||'').includes(letter))
-              : multiSelected.includes(letter);
+              ? (Array.isArray(displayAns) ? displayAns.includes(letter) : (displayAns||'').includes(letter))
+              : displaySelected.includes(letter);
             let cls = '';
             if (answered) {
               if (isCorrectOpt) cls = 'correct';
@@ -2771,12 +3246,16 @@ const Pages = {
         `;
       }
 
-      // 搜题按钮（答完或不会做后显示，放在题型badge同行右边）
+      // 搜题+笔记按钮（答完或不会做后显示）
       const showSearch = answered && !isExam;
+      const hasNote = q.note && q.note.trim();
       body.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
           <div class="quiz-type-badge" style="margin-bottom:0">${q.type}</div>
-          ${showSearch ? `<button id="quiz-search-btn" style="display:flex;align-items:center;gap:3px;color:var(--accent);font-size:12px;padding:3px 8px;border:1px solid var(--accent-light);border-radius:12px;background:var(--accent-light)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>&nbsp;搜题</button>` : ''}
+          ${showSearch ? `<div style="display:flex;gap:6px">
+            <button id="quiz-note-btn" style="display:flex;align-items:center;gap:3px;font-size:12px;padding:3px 8px;border-radius:12px;border:1px solid ${hasNote?'var(--warn)':'var(--border)'};background:${hasNote?'var(--warn-light)':'var(--surface2)'};color:${hasNote?'var(--warn)':'var(--text3)'}">✏️ ${hasNote?'查看笔记':'记笔记'}</button>
+            <button id="quiz-search-btn" style="display:flex;align-items:center;gap:3px;color:var(--accent);font-size:12px;padding:3px 8px;border:1px solid var(--accent-light);border-radius:12px;background:var(--accent-light)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>&nbsp;搜题</button>
+          </div>` : ''}
         </div>
         <div class="quiz-question">${Utils.esc(q.question)}</div>
         ${qBody}
@@ -2790,13 +3269,23 @@ const Pages = {
         body.querySelector('#quiz-search-btn')?.addEventListener('click', () => {
           window.open('https://www.baidu.com/s?wd=' + encodeURIComponent(q.question), '_blank');
         });
+        body.querySelector('#quiz-note-btn')?.addEventListener('click', () => {
+          Actions._showNoteEditor(q, () => renderQ());
+        });
       }
 
       // 选项点击
       if (!answered || isExam) {
         body.querySelectorAll('.option-item').forEach(opt => {
           opt.onclick = () => {
-            const letter = opt.dataset.letter;
+            const displayLetter = opt.dataset.letter;
+            // 还原为原始字母（shuffle 反向映射）
+            const sh = shuffledOpts[curIdx];
+            let letter = displayLetter;
+            if (sh) {
+              // 找 oldToNew 中值等于 displayLetter 的键
+              letter = Object.keys(sh.oldToNew).find(k => sh.oldToNew[k] === displayLetter) || displayLetter;
+            }
             if (q.type === '多选') {
               // 多选：toggle选中，不自动提交
               if (multiSelected.includes(letter)) {
@@ -2891,28 +3380,24 @@ const Pages = {
       const skipped = userAnswer === '__skipped__';
       const correct = !skipped && isCorrect(q, userAnswer);
 
-      // 更新权重和统计
+      // SM-2 SRS 更新 + 统计
       if (!isExam) {
         const freshQ = (await DB.getAllQuestions()).find(x => x.id === q.id) || q;
-        if (correct) {
-          freshQ.rightCount = (freshQ.rightCount || 0) + 1;
-          freshQ.weight = Math.max(1, (freshQ.weight || 1) - 0.3);
-        } else {
-          // 答错或不会做都增加 wrongCount
-          freshQ.wrongCount = (freshQ.wrongCount || 0) + 1;
-          freshQ.weight = Math.min(10, (freshQ.weight || 1) + 0.5 + freshQ.wrongCount * 0.1);
-        }
+        // grade: 5=轻松答对, 4=正确, 3=勉强对, 0=跳过/答错
+        const grade = skipped ? 0 : correct ? 5 : 0;  // grade5=轻松答对→EF增大
+        const srsResult = Utils.srsUpdate(freshQ, grade);
+        Object.assign(freshQ, srsResult);
         Object.assign(q, freshQ);
         await DB.saveQuestion(freshQ);
 
         const totalAnswered = ((await DB.getMeta('totalAnswered')) || 0) + 1;
-        const totalRight = ((await DB.getMeta('totalRight')) || 0) + (correct ? 1 : 0);
-        const totalWrong = ((await DB.getMeta('totalWrong')) || 0) + (correct ? 0 : 1);
+        const totalRight = ((await DB.getMeta('totalRight')) || 0) + (correct && !skipped ? 1 : 0);
+        const totalWrong = ((await DB.getMeta('totalWrong')) || 0) + (!correct || skipped ? 1 : 0);
         await DB.setMeta('totalAnswered', totalAnswered);
         await DB.setMeta('totalRight', totalRight);
         await DB.setMeta('totalWrong', totalWrong);
 
-        const pts = (correct && !skipped) ? 2 : 0;
+        const pts = (correct && !skipped) ? 2 : (skipped ? 0 : 1);  // 答对+2，答错+1，不会做+0
         const points = ((await DB.getMeta('points')) || 0) + pts;
         State.points = points;
         await DB.setMeta('points', points);
@@ -2931,14 +3416,11 @@ const Pages = {
         const correct = isCorrect(q, ua);
         if (correct) right++;
         const freshQ = (await DB.getAllQuestions()).find(x => x.id === q.id) || q;
-        if (correct) {
-          freshQ.rightCount = (freshQ.rightCount||0) + 1;
-          freshQ.weight = Math.max(1, (freshQ.weight||1) - 0.3);
-        } else if (ua !== null && ua !== undefined) {
-          freshQ.wrongCount = (freshQ.wrongCount||0) + 1;
-          freshQ.weight = Math.min(10, (freshQ.weight||1) + 0.5 + freshQ.wrongCount * 0.1);
+        if (ua !== null && ua !== undefined) {
+          const grade = correct ? 5 : 0;
+          Object.assign(freshQ, Utils.srsUpdate(freshQ, grade));
+          await DB.saveQuestion(freshQ);
         }
-        await DB.saveQuestion(freshQ);
       }
       // 积分
       const examPoints = right * 3;
@@ -2953,9 +3435,11 @@ const Pages = {
       showResult(right, questions.length, timeTaken, examPoints);
     }
 
-    function showResult(right, total, timeSec, pts) {
+    function showResult(right, total, timeSec, pts, isPractice = false) {
       const pct = Math.round(right / total * 100);
       const grade = pct >= 90 ? '🎉 优秀' : pct >= 75 ? '👍 良好' : pct >= 60 ? '😊 及格' : '💪 继续加油';
+      const skipped = answers.filter(a => a === '__skipped__').length;
+      const unanswered = answers.filter(a => a === null).length;
       body.innerHTML = `
         <div class="result-score">
           <div class="result-circle" style="--pct:${pct}%">
@@ -2969,19 +3453,18 @@ const Pages = {
         </div>
         <div class="stat-card" style="margin:0 0 12px">
           <div class="stat-row"><span class="stat-label">答对</span><span class="stat-val text-success">${right} 题</span></div>
-          <div class="stat-row"><span class="stat-label">答错</span><span class="stat-val text-danger">${total - right} 题</span></div>
-          <div class="stat-row"><span class="stat-label">未答</span><span class="stat-val">${answers.filter(a=>a===null).length} 题</span></div>
-          <div class="stat-row"><span class="stat-label">本次获得积分</span><span class="stat-val"><span class="points-badge" style="font-size:14px">${Icons.coin}+${pts}</span></span></div>
+          <div class="stat-row"><span class="stat-label">答错</span><span class="stat-val text-danger">${total - right - skipped - unanswered} 题</span></div>
+          ${skipped > 0 ? `<div class="stat-row"><span class="stat-label">不会做</span><span class="stat-val" style="color:var(--warn)">${skipped} 题</span></div>` : ''}
+          ${unanswered > 0 ? `<div class="stat-row"><span class="stat-label">未答</span><span class="stat-val">${unanswered} 题</span></div>` : ''}
+          ${!isPractice ? `<div class="stat-row"><span class="stat-label">本次获得积分</span><span class="stat-val"><span class="points-badge" style="font-size:14px">${Icons.coin}+${pts}</span></span></div>` : ''}
         </div>
       `;
       footer.innerHTML = `
         <button class="btn btn-outline flex-1" onclick="this.closest('.page')._quit()">返回首页</button>
-        <button class="btn btn-primary flex-1" onclick="this.closest('.page')._reviewExam()">查看解析</button>
+        ${!isPractice ? `<button class="btn btn-primary flex-1" onclick="this.closest('.page')._reviewExam()">逐题查看</button>` : ''}
       `;
       el._reviewExam = () => {
-        // 切换到逐题查看模式
         curIdx = 0;
-        // 标记为查看模式
         el._viewMode = true;
         renderQView();
       };
@@ -3030,12 +3513,25 @@ const Pages = {
         `;
       }
 
+      const hasNote = q.note && q.note.trim();
       body.innerHTML = `
-        <div class="quiz-type-badge">${q.type}</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div class="quiz-type-badge" style="margin-bottom:0">${q.type}</div>
+          <div style="display:flex;gap:6px">
+            <button id="view-note-btn" style="display:flex;align-items:center;gap:3px;font-size:12px;padding:3px 8px;border-radius:12px;border:1px solid ${hasNote?'var(--warn)':'var(--border)'};background:${hasNote?'var(--warn-light)':'var(--surface2)'};color:${hasNote?'var(--warn)':'var(--text3)'}">✏️ ${hasNote?'查看笔记':'记笔记'}</button>
+            <button id="view-search-btn" style="display:flex;align-items:center;gap:3px;color:var(--accent);font-size:12px;padding:3px 8px;border:1px solid var(--accent-light);border-radius:12px;background:var(--accent-light)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>&nbsp;搜题</button>
+          </div>
+        </div>
         <div class="quiz-question">${Utils.esc(q.question)}</div>
         ${qBody}
         ${q.explanation ? `<div class="explanation-box"><div class="explanation-title">💡 解析</div><div class="explanation-text">${Utils.esc(q.explanation)}</div></div>` : ''}
       `;
+      body.querySelector('#view-search-btn')?.addEventListener('click', () => {
+        window.open('https://www.baidu.com/s?wd=' + encodeURIComponent(q.question), '_blank');
+      });
+      body.querySelector('#view-note-btn')?.addEventListener('click', () => {
+        Actions._showNoteEditor(q, () => renderQView());
+      });
 
       const isFirst = curIdx === 0, isLast = curIdx === questions.length - 1;
       footer.innerHTML = `
@@ -3046,12 +3542,6 @@ const Pages = {
       `;
       el._viewPrev = () => { if (curIdx > 0) { curIdx--; renderQView(); } };
       el._viewNext = () => { if (curIdx < questions.length - 1) { curIdx++; renderQView(); } };
-      // 考试复查模式：显示搜索按钮
-      const viewSearchBtn = document.createElement('button');
-      viewSearchBtn.style.cssText = 'display:flex;align-items:center;gap:6px;color:var(--accent);font-size:13px;padding:6px 0';
-      viewSearchBtn.innerHTML = Icons.search + ' <span>百度搜索题目</span>';
-      viewSearchBtn.onclick = () => window.open('https://www.baidu.com/s?wd=' + encodeURIComponent(q.question), '_blank');
-      body.appendChild(viewSearchBtn);
     }
 
     // 方法绑定
@@ -3071,6 +3561,7 @@ const Pages = {
         </div>`;
       overlay.querySelector('#confirm-quit-btn').onclick = () => {
         overlay.remove();
+        StudyTimer.stop();
         if (examTimer) clearInterval(examTimer);
         Nav.pop();
       };
@@ -3101,9 +3592,11 @@ const Pages = {
     };
     el._submitExam = () => submitExam();
     el._finish = async () => {
+      StudyTimer.stop();
+      const timeTaken = Math.floor((Date.now() - examStartTime) / 1000);
       const right = answers.filter((a, i) => isCorrect(questions[i], a)).length;
-      Utils.toast(`完成！答对 ${right}/${questions.length} 题`);
-      Nav.pop();
+      const pts = (await DB.getMeta('points')) || 0; // 已在答题时累积
+      showResult(right, questions.length, timeTaken, 0, true);
     };
     // 修正当前题目的答案（做题中发现答案有误时用）
     el._editAnswer = () => {
@@ -3156,6 +3649,111 @@ const Actions = {
       });
       setTimeout(() => html.classList.remove('theme-transitioning'), 400);
     });
+  },
+
+  _showQDetail(q, onSave) {
+    const now = Date.now();
+    const lvl = q.srsLevel || 0;
+    const ease = q.srsEase ? q.srsEase.toFixed(2) : '2.50';
+    const ivlMin = q.srsInterval || 0;
+    const ivlStr = ivlMin < 60 ? `${ivlMin}分钟`
+      : ivlMin < 1440 ? `${(ivlMin/60).toFixed(1)}小时`
+      : `${(ivlMin/1440).toFixed(1)}天`;
+    const nextStr = q.srsNextReview
+      ? (q.srsNextReview <= now ? '现在到期' : (() => {
+          const diff = q.srsNextReview - now;
+          if (diff < 3600000) return `${Math.round(diff/60000)}分钟后`;
+          if (diff < 86400000) return `${Math.round(diff/3600000)}小时后`;
+          return `${Math.round(diff/86400000)}天后`;
+        })())
+      : '未复习';
+    const lastStr = q.srsLastReview
+      ? new Date(q.srsLastReview).toLocaleString('zh')
+      : '从未';
+    const statusColor = !q.srsNextReview ? 'var(--text3)'
+      : q.srsNextReview <= now ? 'var(--danger)' : 'var(--success)';
+    const mastered = q.srsNextReview && q.srsNextReview > now && (q.wrongCount||0) === 0 && (q.srsLevel||0) >= 2;
+    const statusLabel = !q.srsNextReview ? '新题'
+      : q.srsNextReview <= now ? '待复习'
+      : mastered ? '已掌握' : '学习中';
+
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.innerHTML = `
+      <div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px;line-height:1.4">${Utils.esc(q.question.slice(0,60))}${q.question.length>60?'…':''}</div>
+        <div style="display:flex;gap:6px;margin-bottom:14px">
+          <span class="tag tag-accent">${q.type}</span>
+          <span style="font-size:12px;padding:2px 8px;border-radius:10px;background:var(--surface2);color:${statusColor};font-weight:500">${statusLabel}</span>
+        </div>
+
+        <div class="section-title" style="margin:0 0 8px">SRS 学习状态</div>
+        <div class="stat-card" style="margin-bottom:14px">
+          <div class="stat-row"><span class="stat-label">记忆等级</span><span class="stat-val">Lv.${lvl}</span></div>
+          <div class="stat-row"><span class="stat-label">下次复习间隔</span><span class="stat-val">${ivlStr}</span></div>
+          <div class="stat-row"><span class="stat-label">难度因子</span><span class="stat-val">${ease}</span></div>
+          <div class="stat-row"><span class="stat-label">下次复习</span><span class="stat-val" style="color:${statusColor}">${nextStr}</span></div>
+          <div class="stat-row"><span class="stat-label">上次复习</span><span class="stat-val">${lastStr}</span></div>
+          <div class="stat-row"><span class="stat-label">答对</span><span class="stat-val text-success">${q.rightCount||0} 次</span></div>
+          <div class="stat-row"><span class="stat-label">答错</span><span class="stat-val text-danger">${q.wrongCount||0} 次</span></div>
+        </div>
+
+        <div class="section-title" style="margin:0 0 8px">✏️ 笔记</div>
+        ${q.note
+          ? `<div style="background:var(--warn-light);border-radius:var(--radius3);padding:12px;font-size:14px;color:var(--text);line-height:1.6;margin-bottom:12px;white-space:pre-wrap">${Utils.esc(q.note)}</div>`
+          : `<div style="color:var(--text3);font-size:13px;margin-bottom:12px;padding:10px 0">还没有笔记，答题后可添加</div>`}
+
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline flex-1" id="detail-edit-note">✏️ ${q.note?'编辑笔记':'添加笔记'}</button>
+          <button class="btn btn-outline flex-1" id="detail-edit-q">${Icons.edit} 编辑题目</button>
+        </div>
+        <button class="btn btn-primary btn-block" style="margin-top:8px" id="detail-start-btn">开始做题</button>
+      </div>`;
+    ov.onclick = e => { if (e.target === ov) ov.remove(); };
+    document.body.appendChild(ov);
+    ov.querySelector('#detail-edit-note').onclick = () => {
+      ov.remove();
+      Actions._showNoteEditor(q, onSave);
+    };
+    ov.querySelector('#detail-edit-q').onclick = () => {
+      ov.remove();
+      Nav.push('editQ', { folderId: q.folderId, qId: q.id });
+    };
+    ov.querySelector('#detail-start-btn').onclick = () => {
+      ov.remove();
+      // 以单题形式开始答题
+      Nav.push('quiz', { questions: [q], startIdx: 0, mode: 'practice' });
+    };
+  },
+
+  _showNoteEditor(q, onSave) {
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.innerHTML = `
+      <div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-title" style="margin-bottom:12px">✏️ 笔记</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${Utils.esc(q.question)}</div>
+        <textarea id="note-input" class="form-input" rows="6" placeholder="记下你的理解、记忆技巧或补充说明..." style="resize:none;width:100%;min-height:120px">${Utils.esc(q.note||'')}</textarea>
+        <div style="display:flex;gap:10px;margin-top:12px">
+          <button class="btn btn-outline flex-1" onclick="this.closest('.modal-overlay').remove()">取消</button>
+          <button class="btn btn-primary flex-1" id="note-save-btn">保存</button>
+        </div>
+      </div>`;
+    ov.onclick = e => { if (e.target === ov) ov.remove(); };
+    document.body.appendChild(ov);
+    const inp = ov.querySelector('#note-input');
+    setTimeout(() => inp?.focus(), 100);
+    ov.querySelector('#note-save-btn').onclick = async () => {
+      q.note = inp.value.trim();
+      const freshQ = (await DB.getAllQuestions()).find(x => x.id === q.id) || q;
+      freshQ.note = q.note;
+      await DB.saveQuestion(freshQ);
+      ov.remove();
+      Utils.toast(q.note ? '笔记已保存' : '笔记已清除');
+      if (onSave) onSave();
+    };
   },
 
   showContact() {
@@ -3389,7 +3987,8 @@ const Actions = {
                 question: q.question||'', options: q.options,
                 answer: String(q.answer||''), answers,
                 explanation: q.explanation||'',
-                wrongCount:0, rightCount:0, weight:1, starred:false, createdAt:Date.now()
+                note: q.note||'',
+                wrongCount:0, rightCount:0, starred:false, createdAt:Date.now()
               });
               count++;
             }
@@ -3406,7 +4005,8 @@ const Actions = {
               folderId: folder.id, type: q.type||'填空',
               question: q.question||'', options: q.options,
               answer: String(q.answer||''), explanation: q.explanation||'',
-              wrongCount:0, rightCount:0, weight:1, starred:false, createdAt:Date.now()
+              note: q.note||'',
+              wrongCount:0, rightCount:0, starred:false, createdAt:Date.now()
             });
             count++;
           }
@@ -3438,11 +4038,10 @@ const Actions = {
           if (q.options && q.options.length) out.options = q.options;
           if (q.answers && q.answers.length > 1) out.answers = q.answers;
           if (q.explanation) out.explanation = q.explanation;
-          // 保留学习统计（可选，导入时恢复进度用）
+          if (q.note) out.note = q.note;
           if (q.wrongCount) out.wrongCount = q.wrongCount;
           if (q.rightCount) out.rightCount = q.rightCount;
           if (q.starred) out.starred = true;
-          if (q.weight && q.weight !== 1) out.weight = q.weight;
           return out;
         })
       }))
