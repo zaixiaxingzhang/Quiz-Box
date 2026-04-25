@@ -244,6 +244,7 @@ Quiz-Box/
 
 ## 致谢
 
+- 代码：Claude，ChatGPT，GLM
 - 字体：[Noto Sans SC](https://fonts.google.com/noto/specimen/Noto+Sans+SC)（Google Fonts）
 - 排行榜后端：[Supabase](https://supabase.com/)
 - 图标：内联 SVG，无需网络加载
