@@ -12,15 +12,17 @@ jobs:
     timeout-minutes: 2
 
     steps:
-      - name: Ping Supabase database
+      - name: Ping Supabase keepalive RPC
         env:
           SUPABASE_URL: https://eomtqlieheskawkttbpf.supabase.co
-          SUPABASE_KEY: sb_publishable_QboTMKGJX8cACeAu4uwzcA_7lNv8lhi
+          SUPABASE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
         run: |
           set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error \
-            --request GET \
-            --url "$SUPABASE_URL/rest/v1/leaderboard?select=id&limit=1" \
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --url "$SUPABASE_URL/rest/v1/rpc/keepalive_ping" \
             --header "apikey: $SUPABASE_KEY" \
-            --header "Authorization: Bearer $SUPABASE_KEY")
-          echo "Supabase database request succeeded: $response"
+            --header "Authorization: Bearer $SUPABASE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{}'
+          echo "Supabase keepalive RPC succeeded."
