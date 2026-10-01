@@ -1,0 +1,26 @@
+name: Supabase Keepalive
+
+on:
+  schedule:
+    # Run once per day. GitHub Actions uses UTC.
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Ping Supabase database
+        env:
+          SUPABASE_URL: https://eomtqlieheskawkttbpf.supabase.co
+          SUPABASE_KEY: sb_publishable_QboTMKGJX8cACeAu4uwzcA_7lNv8lhi
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            --request GET \
+            --url "$SUPABASE_URL/rest/v1/leaderboard?select=id&limit=1" \
+            --header "apikey: $SUPABASE_KEY" \
+            --header "Authorization: Bearer $SUPABASE_KEY")
+          echo "Supabase database request succeeded: $response"
